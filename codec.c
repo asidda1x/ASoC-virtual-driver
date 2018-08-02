@@ -5,6 +5,7 @@
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
+#include <sound/soc-dapm.h>
 #include <sound/initval.h>
 #include <sound/tlv.h>
 
@@ -71,11 +72,35 @@ static int codec_hw_params(struct snd_pcm_substream *substream,
 	printk("In codec_hw_params\n");
 	return 0;
 }
+
+static int codec_pcm_startup(struct snd_pcm_substream *substream,
+		struct snd_soc_dai *dai)
+{
+	printk("In %s\n", __func__);
+	return 0;
+}
+
+static void codec_pcm_shutdown(struct snd_pcm_substream *substream,
+		struct snd_soc_dai *dai)
+{
+	printk("In %s\n", __func__);
+}
+
+static int codec_pcm_prepare(struct snd_pcm_substream *substream,
+		struct snd_soc_dai *dai)
+{
+	printk("In %s\n", __func__);
+	return 0;
+}
+
 static const struct snd_soc_dai_ops codec_dai_ops = {
-	 .hw_params = codec_hw_params,
-	 .set_fmt = codec_set_dai_fmt,
-	 .set_sysclk = codec_set_dai_sysclk,
-	 .set_bclk_ratio = codec_set_bclk_ratio,
+	.startup = codec_pcm_startup,
+	.shutdown = codec_pcm_shutdown,
+	.prepare = codec_pcm_prepare,
+	.hw_params = codec_hw_params,
+	.set_fmt = codec_set_dai_fmt,
+	.set_sysclk = codec_set_dai_sysclk,
+	.set_bclk_ratio = codec_set_bclk_ratio,
 };
 
 static struct snd_soc_dai_driver codec_dai[] = {
@@ -101,6 +126,13 @@ static struct snd_soc_dai_driver codec_dai[] = {
 		.symmetric_rates = 1,
 	}
 };
+
+static int rt298_spk_event(struct snd_soc_dapm_widget *w,
+			    struct snd_kcontrol *kcontrol, int event)
+{
+	pr_info("In rt298_spk_event\n");
+	return 0;
+}
 
 static struct snd_soc_codec_driver codec_driver = {
 	/*driver ops*/
@@ -170,5 +202,7 @@ void __exit codec_exit(void)
 module_init(codec_init);
 module_exit(codec_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("JAIKRISHNA");
 MODULE_DESCRIPTION("My first codec driver");
+

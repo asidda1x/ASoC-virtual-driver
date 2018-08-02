@@ -69,5 +69,6 @@ static struct platform_driver s_machine = {
 
 module_platform_driver(s_machine);
 
-MODULE_LICENSE("Sample ASoC Machine driver");
+MODULE_AUTHOR("JAIKRISHNA");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:sample-machine");
