@@ -14,23 +14,27 @@ struct s_plat_dev
 	struct platform_device *mach_dev;		
 };
 
-struct timer_list timer;
-//ktime_t kt;
-uint32_t Bps; //Bytes per second
-uint32_t per_cnt; //Period count
-uint32_t pos; //Hardware pointer position
-unsigned long timer_cal; //time taken for each period 
+struct buffer_manipulation_tools {
+	struct timer_list timer;
+	uint32_t Bps; //Bytes per second
+	unsigned long per_size; //Period size in bytes
+	uint32_t pos; //Hardware pointer position in ring buffer
+	unsigned long timer_cal; //time taken for each period
+	unsigned stop_timer; 
+};
 
 /*AUDIO FUNDAS
  * 1 Sample = Number of bits can be transferred in single channel at a time
  * 1 Frame = Total number of Samples(in bytes) can be transferred in all the channels at a time.
  * 1 Period = Number of frames, hardware can process at a time. So after processing of each period, hardware generates an interrupt.
  * Rate is called as a sample rate can be defined as amount of data can be transferred per second.
- * Based on rate BYtes per second is calculated.
- * Then number of Bytes per second(Bps) = Number_of_channels * Sample size in bytes * Rate
+ * ALSA calculates buffer interms of frames. So in practical rate is number of frames per second.
+ * Based on rate Bytes per second is calculated.
+ * Then number of Bytes per second(Bps) = (Number_of_channels * Sample size in bytes) * Rate
  * Eg: Rate: 19200, Channels: 2, Format: 16 bit
- *	Then number of bytes per second(Bps) = Number_of_channels * Sample size in bytes * Rate
+ *	Then number of bytes per second(Bps) = 2 * 2 * 19200 = 76800
  */
+
 static struct snd_pcm_hardware asoc_uspace_pcm_hw = {
 	.info =		(SNDRV_PCM_INFO_MMAP |
 			SNDRV_PCM_INFO_INTERLEAVED |
@@ -56,19 +60,46 @@ static struct snd_pcm_hardware asoc_uspace_pcm_hw = {
 	.fifo_size =		0,
 };
 
-void timer_callback(unsigned long a)
+struct buffer_manipulation_tools *get_bmt(struct snd_pcm_substream *ss)
 {
-	struct snd_pcm_substream *substream = (struct snd_pcm_substream *)a;
-	per_cnt++;
-	mod_timer(&timer,jiffies+ (1000/timer_cal));
+	return ss->runtime->private_data;
+}
+
+void start_timer(struct buffer_manipulation_tools *bmt)
+{
+	unsigned long jif;
+	if(!bmt->stop_timer) {
+		jif = bmt->timer_cal;
+		jif = (jif + bmt->Bps - 1)/bmt->Bps;
+		printk("addl jiffies: %lu\n", jif);
+		mod_timer(&bmt->timer, jiffies + jif);
+	}
+}
+
+void stop_timer(struct buffer_manipulation_tools *bmt)
+{
+	bmt->stop_timer = 1;
+	del_timer(&bmt->timer);
+	bmt->timer.expires = 0;
+}
+
+void update_pos(struct buffer_manipulation_tools *bmt)
+{
+	bmt->pos += bmt->per_size;
+}
+
+void timer_callback(unsigned long pvt_data)
+{
+	struct snd_pcm_substream *substream = (struct snd_pcm_substream *)pvt_data;
+	struct buffer_manipulation_tools *bmt = get_bmt(substream);
+	update_pos(bmt);
 	snd_pcm_period_elapsed(substream);
-	printk("In %s per_cnt %u \n", __func__, per_cnt);
+	start_timer(bmt);
 }
 
 static int asoc_platform_open(struct snd_pcm_substream *substream)
 {
 	DEBUG_PRINT;
-	setup_timer(&timer, timer_callback, (unsigned long)substream);
 	snd_soc_set_runtime_hwparams(substream, &asoc_uspace_pcm_hw);
 	return 0;
 }
@@ -79,63 +110,19 @@ static int asoc_platform_close(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-static int asoc_platform_pcm_trigger(struct snd_pcm_substream *substream,
-								int cmd)
-{
-	struct snd_pcm_runtime *rtd = substream->runtime;
-	struct snd_pcm_runtime *runtime = substream->runtime;
-
-	DEBUG_PRINT;
-	printk("sample-pcm:buffer_size = %ld,"
-			"dma_area = %p, dma_bytes = %zu\n",
-			rtd->buffer_size, rtd->dma_area, rtd->dma_bytes);
-	printk("cmd: %x\n", cmd);
-	switch (cmd) {
-		case SNDRV_PCM_TRIGGER_START:
-	printk("runtime->access: %02x\n", runtime->access);
-	printk("runtime->format: %02x\n", runtime->format);
-	printk("runtime->frame_bits: %ux\n", runtime->frame_bits);
-	printk("runtime->rate: %u\n", runtime->rate);
-	printk("runtime->channels: %02x\n", runtime->channels);
-	printk("runtime->period_size: %lu\n", runtime->period_size);
-	printk("runtime->period_size: %u\n", frames_to_bytes(runtime, runtime->period_size));
-	printk("runtime->periods: %02x\n", runtime->periods);
-	printk("runtime->buffer_size: %lu\n", runtime->buffer_size);
-	printk("runtime->buffer_size: %u\n", frames_to_bytes(runtime, runtime->buffer_size));
-
-		Bps = (runtime->channels * (runtime->frame_bits / 8) * runtime->rate);
-		printk("Bps: %u\n",Bps);
-		timer_cal = Bps/frames_to_bytes(runtime, runtime->period_size);
-		printk("timer_cal: %02x\n", timer_cal);
-		per_cnt = 0;
-
-		mod_timer(&timer,jiffies+ (1000/timer_cal));
-		case SNDRV_PCM_TRIGGER_RESUME:
-			pr_info("SNDRV_PCM_TRIGGER_RESUME\n");
-			return 0;//get_dummy_ops(substream)->start(substream);
-		case SNDRV_PCM_TRIGGER_STOP:
-			pr_info("SNDRV_PCM_TRIGGER_STOP\n");
-			per_cnt = 0;
-			del_timer(&timer);
-		case SNDRV_PCM_TRIGGER_SUSPEND:
-			pr_info("SNDRV_PCM_TRIGGER_SUSPEND\n");
-			return 0;// get_dummy_ops(substream)->stop(substream);
-	}
-
-	return -EINVAL;
-}
-
 static snd_pcm_uframes_t asoc_platform_pcm_pointer(struct snd_pcm_substream *substream)
 {
-	unsigned int pos = 2024;
-	snd_pcm_uframes_t tmp;
+	snd_pcm_uframes_t rbuf_pos;
+	struct buffer_manipulation_tools *bmt;
+
 	DEBUG_PRINT;
-	pr_info("In asoc_platform_pcm_pointer per_cnt %u\n", per_cnt);
-	tmp = (substream->runtime->period_size * per_cnt);//bytes_to_frames(substream->runtime, position);
-	pr_info("In asoc_platform_pcm_pointer tmp %u\n", tmp);
-	if(tmp >= substream->runtime->buffer_size)
-		return tmp -1;
-	return tmp;
+	bmt = get_bmt(substream);
+	rbuf_pos = bytes_to_frames(substream->runtime, bmt->pos);
+	if( rbuf_pos >= substream->runtime->buffer_size)
+		rbuf_pos %= substream->runtime->buffer_size;
+	
+	pr_info("In asoc_platform_pcm_pointer tmp %lu\n", rbuf_pos);
+	return rbuf_pos;
 }
 
 static const struct snd_pcm_ops platform_ops =
@@ -143,31 +130,20 @@ static const struct snd_pcm_ops platform_ops =
 	.open = asoc_platform_open,
 	.close = asoc_platform_close,
 	.ioctl = snd_pcm_lib_ioctl,
-	.trigger = asoc_platform_pcm_trigger,
 	.pointer = asoc_platform_pcm_pointer,
 	.mmap = snd_pcm_lib_default_mmap,
-	.page = snd_pcm_sgbuf_ops_page,
 };
-
-#define MAX_PREALLOC_SIZE	(32* 1024)
 
 static int platform_pcm_new(struct snd_soc_pcm_runtime *rtd)
 {
-	struct snd_soc_dai *dai = rtd->cpu_dai;
-	struct snd_card *card = rtd->card->snd_card;
-	struct snd_pcm *pcm = rtd->pcm;
-	size_t size;
-	int retval = 0;
-
 	DEBUG_PRINT;
-	printk("%s: retval: %d", __func__, retval);
-	
-	return retval;
+
+	return 0;
 }
 
 static void platform_pcm_free(struct snd_pcm *pcm)
 {
-	snd_pcm_lib_preallocate_free_for_all(pcm);
+	DEBUG_PRINT;
 }
 
 static int platform_soc_probe(struct snd_soc_platform *platform)
@@ -208,17 +184,28 @@ static int dai_pcm_prepare(struct snd_pcm_substream *substream,
 		struct snd_soc_dai *dai)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct buffer_manipulation_tools *bmt = get_bmt(substream);
+	
 	DEBUG_PRINT;
-	printk("runtime->access: %02x\n", runtime->access);
-	printk("runtime->format: %02x\n", runtime->format);
-	printk("runtime->frame_bits: %ux\n", runtime->frame_bits);
+	printk("runtime->access: %u\n", runtime->access);
+	printk("runtime->format: %u\n", runtime->format);
+	printk("runtime->frame_bits: %u\n", runtime->frame_bits);
 	printk("runtime->rate: %u\n", runtime->rate);
-	printk("runtime->channels: %02x\n", runtime->channels);
-	printk("runtime->period_size: %02lx\n", runtime->period_size);
-	printk("runtime->period_size: %02x\n", frames_to_bytes(runtime, runtime->period_size));
-	printk("runtime->periods: %02x\n", runtime->periods);
-	printk("runtime->buffer_size: %02lx\n", runtime->buffer_size);
-	printk("runtime->buffer_size: %02x\n", frames_to_bytes(runtime, runtime->buffer_size));
+	printk("runtime->channels: %u\n", runtime->channels);
+	printk("runtime->period_size: %lu\n", runtime->period_size);
+	printk("runtime->period_size: %u\n", frames_to_bytes(runtime, runtime->period_size));
+	printk("runtime->periods: %u\n", runtime->periods);
+	printk("runtime->buffer_size: %lu\n", runtime->buffer_size);
+	printk("runtime->buffer_size: %u\n", frames_to_bytes(runtime, runtime->buffer_size));
+	bmt->Bps = ((runtime->frame_bits / 8) * runtime->rate);
+	printk("Bps: %u\n",bmt->Bps);
+	printk("sample-pcm:buffer_size = %ld,"
+			"dma_area = %p, dma_bytes = %zu\n",
+			runtime->buffer_size, runtime->dma_area, runtime->dma_bytes);
+	bmt->per_size = frames_to_bytes(runtime, runtime->period_size);
+	printk("HZ: %u\n", HZ);
+	bmt->timer_cal = bmt->per_size * HZ;
+	bmt->pos = 0;
 	return 0;
 }
 
@@ -226,7 +213,17 @@ static int dai_pcm_hw_params(struct snd_pcm_substream *substream,
 		struct snd_pcm_hw_params *params,
 		struct snd_soc_dai *dai)
 {
+	struct buffer_manipulation_tools *bmt;
+
 	DEBUG_PRINT;
+	bmt = kmalloc(sizeof(struct buffer_manipulation_tools), GFP_KERNEL);
+	printk("substream->private_data %x\n", substream->private_data);
+	substream->runtime->private_data = bmt;
+	if(!bmt) {
+		printk("Not enough memory\n");
+		return -ENOMEM;
+	}
+	setup_timer(&bmt->timer, timer_callback, (unsigned long)substream);
 	return snd_pcm_lib_alloc_vmalloc_buffer(substream, params_buffer_bytes(params));
 }
 
@@ -234,6 +231,8 @@ static int dai_pcm_hw_free(struct snd_pcm_substream *substream,
 		struct snd_soc_dai *dai)
 {
 	DEBUG_PRINT;
+	if(substream->runtime->private_data)
+		kfree(substream->runtime->private_data);
 	return snd_pcm_lib_free_vmalloc_buffer(substream);
 	return 0;
 }
@@ -241,7 +240,26 @@ static int dai_pcm_hw_free(struct snd_pcm_substream *substream,
 static int dai_pcm_trigger(struct snd_pcm_substream *substream, int cmd,
 		struct snd_soc_dai *dai)
 {
+	struct buffer_manipulation_tools *bmt = get_bmt(substream);
 	DEBUG_PRINT;
+	printk("cmd: %x\n", cmd);
+	switch (cmd) {
+		case SNDRV_PCM_TRIGGER_START:
+			printk("timer_cal: %02lx\n", bmt->timer_cal);
+			bmt->stop_timer = 0;
+			start_timer(bmt);
+		case SNDRV_PCM_TRIGGER_RESUME:
+			pr_info("SNDRV_PCM_TRIGGER_RESUME\n");
+			return 0;
+		case SNDRV_PCM_TRIGGER_STOP:
+			pr_info("SNDRV_PCM_TRIGGER_STOP\n");
+			stop_timer(bmt);
+			return 0;
+		case SNDRV_PCM_TRIGGER_SUSPEND:
+			pr_info("SNDRV_PCM_TRIGGER_SUSPEND\n");
+			return 0;
+	}
+
 	return 0;
 }
 
@@ -329,17 +347,17 @@ static int s_pdev_probe(struct platform_device *pdev)
 	}
 	platform_set_drvdata(pdev, spd);
 
-	ret = snd_soc_register_component(&pdev->dev, &platform_component,
-			platform_dai,1);
-
-	if (ret) {
-		dev_err(&pdev->dev, "soc component registration failed %d\n", ret);
-		return ret;
-	}
-
 	ret = snd_soc_register_platform(&pdev->dev, &platform_drv);
 	if (ret) {
 		dev_err(&pdev->dev, "soc platform registration failed %d\n", ret);
+		return ret;
+	}
+
+	ret = snd_soc_register_component(&pdev->dev, &platform_component,
+			platform_dai,1);
+	if (ret) {
+		dev_err(&pdev->dev, "soc component registration failed %d\n", ret);
+		snd_soc_unregister_platform(&pdev->dev);
 		return ret;
 	}
 
@@ -361,6 +379,8 @@ static int s_pdev_remove(struct platform_device *pdev)
 	if (spd)
 		destroy_machine_device(spd);
 
+	snd_soc_unregister_component(&pdev->dev); 
+	snd_soc_unregister_platform(&pdev->dev);
 	return 0;
 }
 
