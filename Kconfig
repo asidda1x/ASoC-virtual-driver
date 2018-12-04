@@ -1,5 +1,6 @@
 config SND_SOC_MY
 	tristate "Virtual driver for SoC audio support"
+	default m
 	---help---
 
 	  If you want my ASoC support, you should say Y here and also to the

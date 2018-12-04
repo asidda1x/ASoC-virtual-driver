@@ -5,35 +5,59 @@
 #include <linux/jiffies.h>
 #include <linux/time.h>
 
+#include <linux/init.h>
+#include <linux/err.h>
+#include <linux/platform_device.h>
+#include <linux/jiffies.h>
+#include <linux/slab.h>
+#include <linux/time.h>
+#include <linux/wait.h>
+#include <linux/hrtimer.h>
+#include <linux/math64.h>
+#include <linux/module.h>
+#include <sound/core.h>
+#include <sound/control.h>
+#include <sound/tlv.h>
+#include <sound/pcm.h>
+#include <sound/rawmidi.h>
+#include <sound/info.h>
+#include <sound/initval.h>
+
 #define DEBUG_MACRO "Sample Platform driver:"
 #define DEBUG_PRINT printk("%s In %s\n",DEBUG_MACRO,__func__)
 #define PDEV_NAME "s-plt-dev"
+
+#define get_dummy_ops(substream) \
+	((struct buffer_manipulation_tools *)(substream->runtime->private_data))->timer_ops
+
 snd_pcm_uframes_t position;
 struct s_plat_dev
 {
 	struct platform_device *mach_dev;		
 };
 
-struct buffer_manipulation_tools {
-	struct timer_list timer;
-	uint32_t Bps; //Bytes per second
-	unsigned long per_size; //Period size in bytes
-	uint32_t pos; //Hardware pointer position in ring buffer
-	unsigned long timer_cal; //time taken for each period
-	unsigned stop_timer; 
+struct dummy_timer_ops {
+	int (*create)(struct snd_pcm_substream *);
+	void (*free)(struct snd_pcm_substream *);
+	int (*prepare)(struct snd_pcm_substream *);
+	int (*start)(struct snd_pcm_substream *);
+	int (*stop)(struct snd_pcm_substream *);
+	snd_pcm_uframes_t (*pointer)(struct snd_pcm_substream *);
 };
 
-/*AUDIO FUNDAS
- * 1 Sample = Number of bits can be transferred in single channel at a time
- * 1 Frame = Total number of Samples(in bytes) can be transferred in all the channels at a time.
- * 1 Period = Number of frames, hardware can process at a time. So after processing of each period, hardware generates an interrupt.
- * Rate is called as a sample rate can be defined as amount of data can be transferred per second.
- * ALSA calculates buffer interms of frames. So in practical rate is number of frames per second.
- * Based on rate Bytes per second is calculated.
- * Then number of Bytes per second(Bps) = (Number_of_channels * Sample size in bytes) * Rate
- * Eg: Rate: 19200, Channels: 2, Format: 16 bit
- *	Then number of bytes per second(Bps) = 2 * 2 * 19200 = 76800
- */
+struct buffer_manipulation_tools {
+	const struct dummy_timer_ops *timer_ops;
+	spinlock_t lock;
+	struct timer_list timer;
+	unsigned long base_time;
+	unsigned int frac_pos;	/* fractional sample position (based HZ) */
+	unsigned int frac_period_rest;
+	unsigned int frac_buffer_size;	/* buffer_size * HZ */
+	unsigned int frac_period_size;	/* period_size * HZ */
+	unsigned int rate;
+	int elapsed;
+	struct snd_pcm_substream *substream;
+};
 
 static struct snd_pcm_hardware asoc_uspace_pcm_hw = {
 	.info =		(SNDRV_PCM_INFO_MMAP |
@@ -60,53 +84,161 @@ static struct snd_pcm_hardware asoc_uspace_pcm_hw = {
 	.fifo_size =		0,
 };
 
+static void dummy_systimer_rearm(struct buffer_manipulation_tools *dpcm)
+{
+	mod_timer(&dpcm->timer, jiffies +
+		(dpcm->frac_period_rest + dpcm->rate - 1) / dpcm->rate);
+}
+
+static void dummy_systimer_update(struct buffer_manipulation_tools *dpcm)
+{
+	unsigned long delta;
+
+	delta = jiffies - dpcm->base_time;
+	if (!delta)
+		return;
+	dpcm->base_time += delta;
+	delta *= dpcm->rate;
+	dpcm->frac_pos += delta;
+	while (dpcm->frac_pos >= dpcm->frac_buffer_size)
+		dpcm->frac_pos -= dpcm->frac_buffer_size;
+	while (dpcm->frac_period_rest <= delta) {
+		dpcm->elapsed++;
+		dpcm->frac_period_rest += dpcm->frac_period_size;
+	}
+	dpcm->frac_period_rest -= delta;
+}
+
+static int dummy_systimer_start(struct snd_pcm_substream *substream)
+{
+	struct buffer_manipulation_tools *dpcm = substream->runtime->private_data;
+	spin_lock(&dpcm->lock);
+	dpcm->base_time = jiffies;
+	dummy_systimer_rearm(dpcm);
+	spin_unlock(&dpcm->lock);
+	return 0;
+}
+
+static int dummy_systimer_stop(struct snd_pcm_substream *substream)
+{
+	struct buffer_manipulation_tools *dpcm = substream->runtime->private_data;
+	spin_lock(&dpcm->lock);
+	del_timer(&dpcm->timer);
+	spin_unlock(&dpcm->lock);
+	return 0;
+}
+
+static int dummy_systimer_prepare(struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct buffer_manipulation_tools *dpcm = runtime->private_data;
+
+	dpcm->frac_pos = 0;
+	dpcm->rate = runtime->rate;
+	dpcm->frac_buffer_size = runtime->buffer_size * HZ;
+	dpcm->frac_period_size = runtime->period_size * HZ;
+	dpcm->frac_period_rest = dpcm->frac_period_size;
+	dpcm->elapsed = 0;
+
+	return 0;
+}
+
+static void dummy_systimer_callback(unsigned long data)
+{
+	struct buffer_manipulation_tools *dpcm = (struct buffer_manipulation_tools *)data;
+	unsigned long flags;
+	int elapsed = 0;
+
+	spin_lock_irqsave(&dpcm->lock, flags);
+	dummy_systimer_update(dpcm);
+	dummy_systimer_rearm(dpcm);
+	elapsed = dpcm->elapsed;
+	dpcm->elapsed = 0;
+	spin_unlock_irqrestore(&dpcm->lock, flags);
+	if (elapsed) {
+		pr_info("snd_my: snd_pcm_period_elapsed\n");
+		snd_pcm_period_elapsed(dpcm->substream);
+	}
+}
+
+static snd_pcm_uframes_t
+dummy_systimer_pointer(struct snd_pcm_substream *substream)
+{
+	struct buffer_manipulation_tools *dpcm = substream->runtime->private_data;
+	snd_pcm_uframes_t pos;
+
+	spin_lock(&dpcm->lock);
+	dummy_systimer_update(dpcm);
+	pos = dpcm->frac_pos / HZ;
+	spin_unlock(&dpcm->lock);
+	return pos;
+}
+
+static int dummy_systimer_create(struct snd_pcm_substream *substream)
+{
+	struct buffer_manipulation_tools *dpcm;
+
+	dpcm = kzalloc(sizeof(*dpcm), GFP_KERNEL);
+	if (!dpcm)
+		return -ENOMEM;
+	substream->runtime->private_data = dpcm;
+	setup_timer(&dpcm->timer, dummy_systimer_callback,
+			(unsigned long) dpcm);
+	spin_lock_init(&dpcm->lock);
+	dpcm->substream = substream;
+	return 0;
+}
+
+static void dummy_systimer_free(struct snd_pcm_substream *substream)
+{
+	kfree(substream->runtime->private_data);
+}
+
+static const struct dummy_timer_ops dummy_systimer_ops = {
+	.create =	dummy_systimer_create,
+	.free =		dummy_systimer_free,
+	.prepare =	dummy_systimer_prepare,
+	.start =	dummy_systimer_start,
+	.stop =		dummy_systimer_stop,
+	.pointer =	dummy_systimer_pointer,
+};
+
 struct buffer_manipulation_tools *get_bmt(struct snd_pcm_substream *ss)
 {
 	return ss->runtime->private_data;
 }
 
-void start_timer(struct buffer_manipulation_tools *bmt)
-{
-	unsigned long jif;
-	if(!bmt->stop_timer) {
-		jif = bmt->timer_cal;
-		jif = (jif + bmt->Bps - 1)/bmt->Bps;
-		printk("addl jiffies: %lu\n", jif);
-		mod_timer(&bmt->timer, jiffies + jif);
-	}
-}
-
-void stop_timer(struct buffer_manipulation_tools *bmt)
-{
-	bmt->stop_timer = 1;
-	del_timer(&bmt->timer);
-	bmt->timer.expires = 0;
-}
-
-void update_pos(struct buffer_manipulation_tools *bmt)
-{
-	bmt->pos += bmt->per_size;
-}
-
-void timer_callback(unsigned long pvt_data)
-{
-	struct snd_pcm_substream *substream = (struct snd_pcm_substream *)pvt_data;
-	struct buffer_manipulation_tools *bmt = get_bmt(substream);
-	update_pos(bmt);
-	snd_pcm_period_elapsed(substream);
-	start_timer(bmt);
-}
-
 static int asoc_platform_open(struct snd_pcm_substream *substream)
 {
+	int err;
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	const struct dummy_timer_ops *ops;
+
 	DEBUG_PRINT;
+
+	ops = &dummy_systimer_ops;
+
+	err = ops->create(substream);
+	if (err < 0)
+		return err;
+
+	get_dummy_ops(substream) = ops;
+
 	snd_soc_set_runtime_hwparams(substream, &asoc_uspace_pcm_hw);
+
+	if (err < 0) {
+		get_dummy_ops(substream)->free(substream);
+		return err;
+	}
+
 	return 0;
 }
 
 static int asoc_platform_close(struct snd_pcm_substream *substream)
 {
 	DEBUG_PRINT;
+	get_dummy_ops(substream)->free(substream);
+
 	return 0;
 }
 
@@ -117,10 +249,8 @@ static snd_pcm_uframes_t asoc_platform_pcm_pointer(struct snd_pcm_substream *sub
 
 	DEBUG_PRINT;
 	bmt = get_bmt(substream);
-	rbuf_pos = bytes_to_frames(substream->runtime, bmt->pos);
-	if( rbuf_pos >= substream->runtime->buffer_size)
-		rbuf_pos %= substream->runtime->buffer_size;
-	
+	rbuf_pos = bmt->timer_ops->pointer(substream);
+
 	pr_info("In asoc_platform_pcm_pointer tmp %lu\n", rbuf_pos);
 	return rbuf_pos;
 }
@@ -187,25 +317,9 @@ static int dai_pcm_prepare(struct snd_pcm_substream *substream,
 	struct buffer_manipulation_tools *bmt = get_bmt(substream);
 	
 	DEBUG_PRINT;
-	printk("runtime->access: %u\n", runtime->access);
-	printk("runtime->format: %u\n", runtime->format);
-	printk("runtime->frame_bits: %u\n", runtime->frame_bits);
-	printk("runtime->rate: %u\n", runtime->rate);
-	printk("runtime->channels: %u\n", runtime->channels);
-	printk("runtime->period_size: %lu\n", runtime->period_size);
-	printk("runtime->period_size: %u\n", frames_to_bytes(runtime, runtime->period_size));
-	printk("runtime->periods: %u\n", runtime->periods);
-	printk("runtime->buffer_size: %lu\n", runtime->buffer_size);
-	printk("runtime->buffer_size: %u\n", frames_to_bytes(runtime, runtime->buffer_size));
-	bmt->Bps = ((runtime->frame_bits / 8) * runtime->rate);
-	printk("Bps: %u\n",bmt->Bps);
-	printk("sample-pcm:buffer_size = %ld,"
-			"dma_area = %p, dma_bytes = %zu\n",
-			runtime->buffer_size, runtime->dma_area, runtime->dma_bytes);
-	bmt->per_size = frames_to_bytes(runtime, runtime->period_size);
-	printk("HZ: %u\n", HZ);
-	bmt->timer_cal = bmt->per_size * HZ;
-	bmt->pos = 0;
+
+	bmt->timer_ops->prepare(substream);
+
 	return 0;
 }
 
@@ -216,14 +330,7 @@ static int dai_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct buffer_manipulation_tools *bmt;
 
 	DEBUG_PRINT;
-	bmt = kmalloc(sizeof(struct buffer_manipulation_tools), GFP_KERNEL);
 	printk("substream->private_data %x\n", substream->private_data);
-	substream->runtime->private_data = bmt;
-	if(!bmt) {
-		printk("Not enough memory\n");
-		return -ENOMEM;
-	}
-	setup_timer(&bmt->timer, timer_callback, (unsigned long)substream);
 	return snd_pcm_lib_alloc_vmalloc_buffer(substream, params_buffer_bytes(params));
 }
 
@@ -243,22 +350,16 @@ static int dai_pcm_trigger(struct snd_pcm_substream *substream, int cmd,
 	struct buffer_manipulation_tools *bmt = get_bmt(substream);
 	DEBUG_PRINT;
 	printk("cmd: %x\n", cmd);
+
 	switch (cmd) {
-		case SNDRV_PCM_TRIGGER_START:
-			printk("timer_cal: %02lx\n", bmt->timer_cal);
-			bmt->stop_timer = 0;
-			start_timer(bmt);
-		case SNDRV_PCM_TRIGGER_RESUME:
-			pr_info("SNDRV_PCM_TRIGGER_RESUME\n");
-			return 0;
-		case SNDRV_PCM_TRIGGER_STOP:
-			pr_info("SNDRV_PCM_TRIGGER_STOP\n");
-			stop_timer(bmt);
-			return 0;
-		case SNDRV_PCM_TRIGGER_SUSPEND:
-			pr_info("SNDRV_PCM_TRIGGER_SUSPEND\n");
-			return 0;
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+		return get_dummy_ops(substream)->start(substream);
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+		return get_dummy_ops(substream)->stop(substream);
 	}
+	return -EINVAL;
 
 	return 0;
 }
@@ -421,6 +522,7 @@ static void __exit  pdevexit(void)
 
 module_init(pdevinit);
 module_exit(pdevexit);
+MODULE_AUTHOR("Aravind Siddappaji");
 MODULE_DESCRIPTION("Sample ASoC Platform driver");
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("platform:snd-soc-plat");
